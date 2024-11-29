@@ -200,7 +200,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     BeginRendering(*pipeline, state);
     UpdateDynamicState(*pipeline);
 
-    const auto [vertex_offset, instance_offset] = vs_info.GetDrawOffsets();
+    const auto [vertex_offset, instance_offset] = vs_info.GetDrawOffsets(regs);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -792,9 +792,9 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
-void Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
-    buffer_cache.InvalidateMemory(addr, size);
-    texture_cache.InvalidateMemory(addr, size);
+void Rasterizer::InvalidateMemory(VAddr addr, VAddr addr_aligned, u64 size) {
+    buffer_cache.InvalidateMemory(addr_aligned, size);
+    texture_cache.InvalidateMemory(addr, addr_aligned, size);
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
