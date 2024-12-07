@@ -118,6 +118,7 @@ find_package(PNG 1.6 MODULE)
 find_package(RenderDoc 1.6.0 MODULE)
 find_package(SDL3 3.1.2 CONFIG)
 find_package(SDL_mixer 2.8.0 CONFIG)
+find_package(stb MODULE)
 find_package(toml11 4.2.0 CONFIG)
 find_package(tsl-robin-map 1.3.0 CONFIG)
 find_package(VulkanHeaders 1.3.289 CONFIG)
@@ -210,7 +211,10 @@ set(GNM_LIB src/core/libraries/gnmdriver/gnmdriver.cpp
             src/core/libraries/gnmdriver/gnm_error.h
 )
 
-set(KERNEL_LIB src/core/libraries/kernel/threads/condvar.cpp
+set(KERNEL_LIB src/core/libraries/kernel/sync/mutex.cpp
+               src/core/libraries/kernel/sync/mutex.h
+               src/core/libraries/kernel/sync/semaphore.h
+               src/core/libraries/kernel/threads/condvar.cpp
                src/core/libraries/kernel/threads/event_flag.cpp
                src/core/libraries/kernel/threads/exception.cpp
                src/core/libraries/kernel/threads/exception.h
@@ -496,6 +500,8 @@ set(COMMON src/common/logging/backend.cpp
            src/common/slot_vector.h
            src/common/spin_lock.cpp
            src/common/spin_lock.h
+           src/common/stb.cpp
+           src/common/stb.h
            src/common/string_util.cpp
            src/common/string_util.h
            src/common/thread.cpp
@@ -503,6 +509,7 @@ set(COMMON src/common/logging/backend.cpp
            src/common/types.h
            src/common/uint128.h
            src/common/unique_function.h
+           src/common/va_ctx.h
            src/common/version.h
            src/common/ntapi.h
            src/common/ntapi.cpp
@@ -527,6 +534,12 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/crypto/crypto.cpp
          src/core/crypto/crypto.h
          src/core/crypto/keys.h
+         src/core/devices/base_device.cpp
+         src/core/devices/base_device.h
+         src/core/devices/ioccom.h
+         src/core/devices/logger.cpp
+         src/core/devices/logger.h
+         src/core/devices/nop_device.h
          src/core/file_format/pfs.h
          src/core/file_format/pkg.cpp
          src/core/file_format/pkg.h
@@ -861,10 +874,14 @@ endif()
 create_target_directory_groups(shadps4)
 
 target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui gcn half::half ZLIB::ZLIB PNG::PNG)
-target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::SPIRV glslang::glslang SDL3::SDL3 SDL3_mixer::SDL3_mixer pugixml::pugixml)
+target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::SPIRV glslang::glslang SDL3::SDL3 SDL3_mixer::SDL3_mixer pugixml::pugixml stb::headers)
 
 target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
+
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+    target_compile_definitions(shadps4 PRIVATE ENABLE_USERFAULTFD)
+endif()
 
 if (APPLE)
   option(USE_SYSTEM_VULKAN_LOADER "Enables using the system Vulkan loader instead of directly linking with MoltenVK. Useful for loading validation layers." OFF)

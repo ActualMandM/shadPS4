@@ -102,9 +102,6 @@ RenderState Rasterizer::PrepareRenderState(u32 mrt_mask) {
             continue;
         }
 
-        const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress());
-        texture_cache.TouchMeta(col_buf.CmaskAddress(), false);
-
         const auto& hint = liverpool->last_cb_extent[col_buf_id];
         auto& [image_id, desc] = cb_descs.emplace_back(std::piecewise_construct, std::tuple{},
                                                        std::tuple{col_buf, hint});
@@ -112,6 +109,10 @@ RenderState Rasterizer::PrepareRenderState(u32 mrt_mask) {
         image_id = bound_images.emplace_back(image_view.image_id);
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
+
+        const auto slice = image_view.info.range.base.layer;
+        const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
+        texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
 
         const auto mip = image_view.info.range.base.level;
         state.width = std::min<u32>(state.width, std::max(image.info.size.width >> mip, 1u));
@@ -134,8 +135,6 @@ RenderState Rasterizer::PrepareRenderState(u32 mrt_mask) {
          (regs.depth_control.stencil_enable &&
           regs.depth_buffer.stencil_info.format != StencilFormat::Invalid))) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
-        const bool is_clear = regs.depth_render_control.depth_clear_enable ||
-                              texture_cache.IsMetaCleared(htile_address);
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] =
             db_desc.emplace(std::piecewise_construct, std::tuple{},
@@ -145,6 +144,11 @@ RenderState Rasterizer::PrepareRenderState(u32 mrt_mask) {
         image_id = bound_images.emplace_back(image_view.image_id);
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
+
+        const auto slice = image_view.info.range.base.layer;
+        const bool is_clear = regs.depth_render_control.depth_clear_enable ||
+                              texture_cache.IsMetaCleared(htile_address, slice);
+        ASSERT(desc.view_info.range.extent.layers == 1);
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
@@ -157,7 +161,7 @@ RenderState Rasterizer::PrepareRenderState(u32 mrt_mask) {
             .clearValue = vk::ClearValue{.depthStencil = {.depth = regs.depth_clear,
                                                           .stencil = regs.stencil_clear}},
         };
-        texture_cache.TouchMeta(htile_address, false);
+        texture_cache.TouchMeta(htile_address, slice, false);
         state.has_depth =
             regs.depth_buffer.z_info.format != AmdGpu::Liverpool::DepthBuffer::ZFormat::Invalid;
         state.has_stencil = regs.depth_buffer.stencil_info.format !=
@@ -165,6 +169,22 @@ RenderState Rasterizer::PrepareRenderState(u32 mrt_mask) {
     }
 
     return state;
+}
+
+[[nodiscard]] std::pair<u32, u32> GetDrawOffsets(
+    const AmdGpu::Liverpool::Regs& regs, const Shader::Info& info,
+    const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader) {
+    u32 vertex_offset = regs.index_offset;
+    u32 instance_offset = 0;
+    if (fetch_shader) {
+        if (vertex_offset == 0 && fetch_shader->vertex_offset_sgpr != -1) {
+            vertex_offset = info.user_data[fetch_shader->vertex_offset_sgpr];
+        }
+        if (fetch_shader->instance_offset_sgpr != -1) {
+            instance_offset = info.user_data[fetch_shader->instance_offset_sgpr];
+        }
+    }
+    return {vertex_offset, instance_offset};
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
@@ -187,13 +207,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     const auto& vs_info = pipeline->GetStage(Shader::Stage::Vertex);
-    buffer_cache.BindVertexBuffers(vs_info);
+    const auto& fetch_shader = pipeline->GetFetchShader();
+    buffer_cache.BindVertexBuffers(vs_info, fetch_shader);
     const u32 num_indices = buffer_cache.BindIndexBuffer(is_indexed, index_offset);
 
     BeginRendering(*pipeline, state);
     UpdateDynamicState(*pipeline);
 
-    const auto [vertex_offset, instance_offset] = vs_info.GetDrawOffsets(regs);
+    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -243,7 +264,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     const auto& vs_info = pipeline->GetStage(Shader::Stage::Vertex);
-    buffer_cache.BindVertexBuffers(vs_info);
+    const auto& fetch_shader = pipeline->GetFetchShader();
+    buffer_cache.BindVertexBuffers(vs_info, fetch_shader);
     buffer_cache.BindIndexBuffer(is_indexed, 0);
 
     const auto& [buffer, base] =
@@ -357,9 +379,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         // will need its full emulation anyways. For cases of metadata read a warning will be
         // logged.
         const auto IsMetaUpdate = [&](const auto& desc) {
-            const VAddr address = desc.GetSharp(info).base_address;
+            const auto sharp = desc.GetSharp(info);
+            const VAddr address = sharp.base_address;
             if (desc.is_written) {
-                if (texture_cache.TouchMeta(address, true)) {
+                // Assume all slices were updates
+                if (texture_cache.ClearMeta(address)) {
                     LOG_TRACE(Render_Vulkan, "Metadata update skipped");
                     return true;
                 }
@@ -371,17 +395,36 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             return false;
         };
 
+        // Assume if a shader reads and writes metas at the same time, it is a copy shader.
+        bool meta_read = false;
         for (const auto& desc : info.buffers) {
             if (desc.is_gds_buffer) {
                 continue;
             }
-            if (IsMetaUpdate(desc)) {
-                return false;
+            if (!desc.is_written) {
+                const VAddr address = desc.GetSharp(info).base_address;
+                meta_read = texture_cache.IsMeta(address);
             }
         }
+
         for (const auto& desc : info.texture_buffers) {
-            if (IsMetaUpdate(desc)) {
-                return false;
+            if (!desc.is_written) {
+                const VAddr address = desc.GetSharp(info).base_address;
+                meta_read = texture_cache.IsMeta(address);
+            }
+        }
+
+        if (!meta_read) {
+            for (const auto& desc : info.buffers) {
+                if (IsMetaUpdate(desc)) {
+                    return false;
+                }
+            }
+
+            for (const auto& desc : info.texture_buffers) {
+                if (IsMetaUpdate(desc)) {
+                    return false;
+                }
             }
         }
     }
@@ -397,10 +440,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         if (!stage) {
             continue;
         }
-        if (stage->uses_step_rates) {
-            push_data.step0 = regs.vgt_instance_step_rate_0;
-            push_data.step1 = regs.vgt_instance_step_rate_1;
-        }
+        push_data.step0 = regs.vgt_instance_step_rate_0;
+        push_data.step1 = regs.vgt_instance_step_rate_1;
         stage->PushUd(binding, push_data);
 
         BindBuffers(*stage, binding, push_data, set_writes, buffer_barriers);
@@ -507,12 +548,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
                 vsharp.base_address, vsharp.GetSize(), desc.is_written, true, buffer_id);
             const u32 fmt_stride = AmdGpu::NumBits(vsharp.GetDataFmt()) >> 3;
-            ASSERT_MSG(fmt_stride == vsharp.GetStride(),
+            const u32 buf_stride = vsharp.GetStride();
+            ASSERT_MSG(buf_stride % fmt_stride == 0,
                        "Texel buffer stride must match format stride");
             const u32 offset_aligned = Common::AlignDown(offset, alignment);
             const u32 adjust = offset - offset_aligned;
             ASSERT(adjust % fmt_stride == 0);
-            push_data.AddOffset(binding.buffer, adjust / fmt_stride);
+            push_data.AddTexelOffset(binding.buffer, buf_stride / fmt_stride, adjust / fmt_stride);
             buffer_view =
                 vk_buffer->View(offset_aligned, vsharp.GetSize() + adjust, desc.is_written,
                                 vsharp.GetDataFmt(), vsharp.GetNumberFmt());
